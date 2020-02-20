@@ -106,7 +106,7 @@ def fetch_from_whats_on_netflix() -> typing.List[MovieInfo]:
 
 
 def fetch_from_finder(provider):
-    # curl
+    # curl equivalent of the request made by browser.
     """
     curl 'https://www.finder.com/netflix-movies'
          -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:72.0) Gecko/20100101 Firefox/72.0'
