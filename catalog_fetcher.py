@@ -1,13 +1,16 @@
+from __future__ import annotations
+
 import requests
 import attr
 import typing
 from bs4 import BeautifulSoup
 
+from imdb import ImdbMovieSet, ImdbMovieInfo, normalize_movie_name
 
-class Constants:
-    FIREFOX_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:72.0) Gecko/20100101 Firefox/72.0'
-    AMAZON_PRIME = "amazon_prime"
-    NETFLIX = "netflix"
+FIREFOX_USER_AGENT = \
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:72.0) Gecko/20100101 Firefox/72.0'
+AMAZON_PRIME = "amazon_prime"
+NETFLIX = "netflix"
 
 
 def warn_if_false(inp, warning):
@@ -25,13 +28,31 @@ class PlatformId(object):
 class MovieInfo(object):
     name: str = ""
     language: str = ""
-    imdb: PlatformId = None
+    imdb: typing.List[ImdbMovieInfo] = attr.Factory(list)
     platforms: typing.List[PlatformId] = attr.Factory(list)
     release_yr: int = -1
     src_to_raw_entry: typing.Dict[str, typing.Dict[str, str]] = attr.Factory(dict)
 
+    def update_imdb(self, imdb_movie_set: ImdbMovieSet) -> MovieInfo:
+        self.imdb = imdb_movie_set.lookup_movie(self.name)
+        return self
+
+    def is_equivalent(self, other: MovieInfo):
+        self_imdbs = set(i.imdb_id for i in self.imdb)
+        other_imdbs = set(i.imdb_id for i in other.imdb)
+        if self_imdbs == other_imdbs and len(self_imdbs) == 0:
+            return True
+        other_platforms = {str(p) for p in other.platforms}
+        self_platforms = {str(p) for p in self.platforms}
+        if not other_platforms.isdisjoint(self_platforms):
+            return True
+        return normalize_movie_name(self.name) == normalize_movie_name(other.name) and \
+               self.release_yr == other.release_yr
+
+
+
     @staticmethod
-    def from_whats_on_netflix(entry: typing.Dict):
+    def from_whats_on_netflix(entry: typing.Dict) -> MovieInfo:
         """
         {
             "title": "​Mayurakshi",
@@ -41,7 +62,7 @@ class MovieInfo(object):
             "image_portrait": "http://occ-0-2430-116.1.nflxso.net/dnm/api/v6/...",
             "rating": "TV-14",
             "quality": "SuperHD",
-            "actors": "Soumitra Chatterjee, Prasenjit Chatterjee, Indrani Haldar, Sudipta Chakraborty",
+            "actors": "Soumitra Chatterjee, Prasenjit Chatterjee, Indrani Haldar, ...",
             "director": "Atanu Ghosh",
             "category": "Dramas\n                  International Movies",
             "imdb": "7.1/10",
@@ -52,8 +73,9 @@ class MovieInfo(object):
         }
         """
         return MovieInfo(
-            name=entry['title'], src_to_raw_entry={"whats-on-netflix.com": entry}, release_yr=entry["titlereleased"],
-            platforms=[PlatformId(platform=Constants.NETFLIX, value=entry['netflixid'])]
+            name=entry['title'], src_to_raw_entry={"whats-on-netflix.com": entry},
+            release_yr=entry["titlereleased"],
+            platforms=[PlatformId(platform=NETFLIX, value=entry['netflixid'])]
         )
 
     @staticmethod
@@ -80,11 +102,25 @@ class MovieInfo(object):
     @staticmethod
     def from_finder(provider, bs_entry):
         data = MovieInfo._finder_entry_to_dict(bs_entry)
-        provider_id = \
-            data["watch_link"].strip("/").split("/")[-1] if provider == Constants.NETFLIX else f"NA_{data['Title']}"
+        if provider == NETFLIX:
+            provider_id = data["watch_link"].strip("/").split("/")[-1]
+        else:
+            provider_id = f"NA_{data['Title']}"
         return MovieInfo(name=data["Title"], src_to_raw_entry={f"finder.com:{provider}": data},
                          release_yr=data["Year of release"],
                          platforms=[PlatformId(platform=provider, value=provider_id)])
+
+
+class MovieInfoCollection:
+    def __init__(self, movie_infos: typing.List[MovieInfo]):
+        self.unknown: typing.List[MovieInfo] = [mi for mi in movie_infos if len(mi.imdb) == 0]
+        self.movie_by_imdb: typing.Dict[str, typing.List[MovieInfo]]
+        for mi in movie_infos:
+            for mi_imdb in mi.imdb:
+                self.movie_by_imdb[mi_imdb.imdb_id].append(mi)
+
+    def merge_with(self, other: MovieInfoCollection):
+        pass
 
 
 def fetch_from_whats_on_netflix() -> typing.List[MovieInfo]:
@@ -100,7 +136,7 @@ def fetch_from_whats_on_netflix() -> typing.List[MovieInfo]:
           -H 'Upgrade-Insecure-Requests: 1'
     """
     url = "https://www.whats-on-netflix.com/wp-content/plugins/whats-on-netflix/json/movie.json"
-    headers = {'User-Agent': Constants.FIREFOX_USER_AGENT}
+    headers = {'User-Agent': FIREFOX_USER_AGENT}
     resp = requests.get(url, headers=headers)
     return [MovieInfo.from_whats_on_netflix(entry) for entry in resp.json()]
 
@@ -120,18 +156,19 @@ def fetch_from_finder(provider):
          -H 'TE: Trailers'
     """
     url = {
-        Constants.NETFLIX: "https://www.finder.com/netflix-movies",
-        Constants.AMAZON_PRIME: "https://www.finder.com/amazon-prime-movies"
+        NETFLIX: "https://www.finder.com/netflix-movies",
+        AMAZON_PRIME: "https://www.finder.com/amazon-prime-movies"
     }[provider]
-    headers = {'User-Agent': Constants.FIREFOX_USER_AGENT}
+    headers = {'User-Agent': FIREFOX_USER_AGENT}
     resp = requests.get(url, headers=headers)
     tables = BeautifulSoup(resp.text, "html.parser").find_all(
         "table", attrs={"class": "luna-table luna-table--responsiveList ts-table"})
     warn_if_false(len(tables) == 1, f"expected only 1 table, but found {len(tables)}")
     table = tables[0]
     rows = table.find_all("tr")
-    warn_if_false(len(rows[0].find_all("td")) == 0,
-                  f"expecting rows[0] to be the header and have no td entries. actual {rows[0].find_all('td')}")
+    row0tds = rows[0].find_all('td')
+    warn_if_false(row0tds == 0,
+                  f"expecting rows[0] to be the header and have no td entries. actual {row0tds}")
     return [MovieInfo.from_finder(provider, row) for row in rows[1:]]
 
 
@@ -139,7 +176,7 @@ if __name__ == '__main__':
     # Manual testing.
     res = fetch_from_whats_on_netflix()
     print(res[0])
-    res = fetch_from_finder(Constants.NETFLIX)
+    res = fetch_from_finder(NETFLIX)
     print(res[0])
-    res = fetch_from_finder(Constants.AMAZON_PRIME)
+    res = fetch_from_finder(AMAZON_PRIME)
     print(res[0])
