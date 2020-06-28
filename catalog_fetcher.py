@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import requests
-import attr
+import argparse
 import typing
+
+import attr
+import requests
+import tabulate
 from bs4 import BeautifulSoup
 
 from imdb import ImdbMovieSet, ImdbMovieInfo, normalize_movie_name
@@ -13,9 +16,15 @@ AMAZON_PRIME = "amazon_prime"
 NETFLIX = "netflix"
 
 
+def log(msg):
+    import time  # Adding the import to make this method easily copy+paste-able.
+    current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"{current_time} --> {msg}")
+
+
 def warn_if_false(inp, warning):
     if not inp:
-        print(warning)
+        log(warning)
 
 
 @attr.s(auto_attribs=True)
@@ -24,18 +33,52 @@ class PlatformId(object):
     value: str = ""
 
 
+def tryint(inp, default):
+    try:
+        return int(inp)
+    except Exception:
+        return default
+
+
 @attr.s(auto_attribs=True)
 class MovieInfo(object):
     name: str = ""
-    language: str = ""
+    languages: typing.Set[str] = attr.Factory(set)
+    regions: typing.Set[str] = attr.Factory(set)
     imdb: typing.List[ImdbMovieInfo] = attr.Factory(list)
     platforms: typing.List[PlatformId] = attr.Factory(list)
     release_yr: int = -1
     src_to_raw_entry: typing.Dict[str, typing.Dict[str, str]] = attr.Factory(dict)
 
+    def get_netflix_url(self):
+        for p in self.platforms:
+            if p.platform == NETFLIX:
+                return f'https://www.netflix.com/title/{p.value}'
+        for v in self.src_to_raw_entry.values():
+            netflixid = v.get('netflixid')
+            if netflixid:
+                return f'https://www.netflix.com/title/{netflixid}'
+        return None
+
+    def get_imdb_rating(self):
+        for v in self.src_to_raw_entry.values():
+            imdb_rating = v.get('imdb')
+            if imdb_rating:
+                return imdb_rating
+        return 'n/a'
+
     def update_imdb(self, imdb_movie_set: ImdbMovieSet) -> MovieInfo:
         self.imdb = imdb_movie_set.lookup_movie(self.name)
+        for imdb_movie_info in self.imdb:
+            self.languages.update(imdb_movie_info.languages)
+            self.regions.update(imdb_movie_info.regions)
         return self
+
+    def to_trimmed_str(self):
+        return f'''-->Name: {self.name} <-- Languages: {','.join(
+            self.languages)} Year: {self.release_yr} ''' + \
+               f'''Sources: {','.join(self.src_to_raw_entry.keys())} ''' + \
+               f'''ImdbInfo: {",".join([x.imdb_id for x in self.imdb])} '''
 
     def is_equivalent(self, other: MovieInfo):
         self_imdbs = set(i.imdb_id for i in self.imdb)
@@ -49,7 +92,14 @@ class MovieInfo(object):
         return normalize_movie_name(self.name) == normalize_movie_name(other.name) and \
                self.release_yr == other.release_yr
 
-
+    def matches(self, languages=None, release_yr=None) -> bool:
+        assert languages or release_yr is not None
+        languages = languages or set()
+        lang_check = not languages or not languages.isdisjoint(self.languages)
+        release_yr_check = not release_yr or \
+                           release_yr == self.release_yr or \
+                           (self.release_yr == -1 and release_yr in {m.year for m in self.imdb})
+        return lang_check and release_yr_check
 
     @staticmethod
     def from_whats_on_netflix(entry: typing.Dict) -> MovieInfo:
@@ -107,7 +157,7 @@ class MovieInfo(object):
         else:
             provider_id = f"NA_{data['Title']}"
         return MovieInfo(name=data["Title"], src_to_raw_entry={f"finder.com:{provider}": data},
-                         release_yr=data["Year of release"],
+                         release_yr=tryint(data["Year of release"], -1),
                          platforms=[PlatformId(platform=provider, value=provider_id)])
 
 
@@ -123,7 +173,7 @@ class MovieInfoCollection:
         pass
 
 
-def fetch_from_whats_on_netflix() -> typing.List[MovieInfo]:
+def fetch_from_whats_on_netflix(enhance) -> typing.List[MovieInfo]:
     # curl equivalent of the request made by browser.
     """
     curl 'https://www.whats-on-netflix.com/wp-content/plugins/whats-on-netflix/json/movie.json'
@@ -138,10 +188,23 @@ def fetch_from_whats_on_netflix() -> typing.List[MovieInfo]:
     url = "https://www.whats-on-netflix.com/wp-content/plugins/whats-on-netflix/json/movie.json"
     headers = {'User-Agent': FIREFOX_USER_AGENT}
     resp = requests.get(url, headers=headers)
-    return [MovieInfo.from_whats_on_netflix(entry) for entry in resp.json()]
+    log("Fetched data from WON")
+    ret = [MovieInfo.from_whats_on_netflix(entry) for entry in resp.json()]
+    imdb_set = ImdbMovieSet(from_movie_names=[m.name for m in ret])
+    log("IMDBMovie set created")
+    if enhance:
+        enhanced = imdb_set.enhance_movie_info()
+        log("Enhanced IMDBMovie set")
+        imdb_set.write_to_sqlite(enhanced)
+        log("Wrote Enhancements back to db")
+    return [m.update_imdb(imdb_set) for m in ret]
 
 
-def fetch_from_finder(provider):
+def update_imdb_for_set():
+    pass
+
+
+def fetch_from_finder(provider, enhance):
     # curl equivalent of the request made by browser.
     """
     curl 'https://www.finder.com/netflix-movies'
@@ -167,16 +230,78 @@ def fetch_from_finder(provider):
     table = tables[0]
     rows = table.find_all("tr")
     row0tds = rows[0].find_all('td')
-    warn_if_false(row0tds == 0,
-                  f"expecting rows[0] to be the header and have no td entries. actual {row0tds}")
-    return [MovieInfo.from_finder(provider, row) for row in rows[1:]]
+    warn_if_false(len(row0tds) == 0,
+                  "Expecting rows[0] to be header, have no td entries.\n" +
+                  f"rows0: {rows[0]}\n" +
+                  f"rows1: {rows[1]}")
+
+    ret = [MovieInfo.from_finder(provider, row) for row in rows[1:]]
+    imdb_set = ImdbMovieSet(from_movie_names=[m.name for m in ret])
+    if enhance:
+        log("IMDBMovie set created")
+        enhanced = imdb_set.enhance_movie_info()
+        log("Enhanced IMDBMovie set")
+        imdb_set.write_to_sqlite(enhanced)
+        log("Wrote Enhancements back to db")
+    return [m.update_imdb(imdb_set) for m in ret]
+
+
+def merge_netflix(movies1: typing.List[MovieInfo], movies2: typing.List[MovieInfo]):
+    movies_by_id: typing.Dict[str, MovieInfo] = {m.get_netflix_url(): m for m in movies1 if
+                                                 m.get_netflix_url()}
+    for m in movies2:
+        nurl = m.get_netflix_url()
+        if not nurl:
+            assert False, m
+        existing = movies_by_id.get(nurl)
+        if not existing:
+            movies_by_id[nurl] = m
+            continue
+        # print(m)
+        existing.src_to_raw_entry.update(m.src_to_raw_entry)
+    return list(movies_by_id.values())
+
+
+def get_netflix_all(enhance):
+    movies1: typing.List[MovieInfo] = fetch_from_whats_on_netflix(enhance)
+    movies2: typing.List[MovieInfo] = fetch_from_finder(NETFLIX, enhance)
+    movies = merge_netflix(movies1, movies2)
+    return movies
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--provider', choices=['netflix', 'amazon'], default='netflix')
+    parser.add_argument('--lang', help='Comma separated language filter', default='')
+    parser.add_argument('--year', help='Release year filter', type=int)
+    parser.add_argument('--enhance', help='Enhance netflix movie information', type=bool, default=False)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.provider == 'netflix':
+        movies = get_netflix_all(args.enhance)
+    elif args.provider == 'amazon':
+        movies =fetch_from_finder(AMAZON_PRIME, args.enhance)
+
+    languages = set()
+    if args.lang:
+        languages = set(args.lang.split(','))
+    filtered_movies: typing.List[MovieInfo] = [m for m in movies if
+                                               m.matches(languages=languages, release_yr=args.year)]
+    filtered_movies.sort(key=lambda x: -int(x.release_yr))
+    rows = [[m.name, m.release_yr,
+             m.get_netflix_url(),
+             m.get_imdb_rating(),
+             # Skip lower case length 2 languages; This is unenhanced imdb info; mostly junk
+             ','.join(set(l for l in m.languages))[:50],
+             ','.join([x.imdb_id for x in m.imdb])[:50]]
+            for m in filtered_movies]
+    print(tabulate.tabulate(
+        rows,
+        headers=["name", "year", "watch_url", "imdb_rating", "lang", "imdb"]))
 
 
 if __name__ == '__main__':
-    # Manual testing.
-    res = fetch_from_whats_on_netflix()
-    print(res[0])
-    res = fetch_from_finder(NETFLIX)
-    print(res[0])
-    res = fetch_from_finder(AMAZON_PRIME)
-    print(res[0])
+    main()
