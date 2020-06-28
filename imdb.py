@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -264,7 +265,6 @@ class ImdbMovieSet:
 
 
 def fetch_movies_from_name(names: typing.List[str]) -> typing.Dict[str, ImdbMovieInfo]:
-    import sqlite3
     conn = sqlite3.connect(str(MOVIES_DB))
     c = conn.cursor()
     ret = {}
@@ -283,7 +283,6 @@ def fetch_movies_from_name(names: typing.List[str]) -> typing.Dict[str, ImdbMovi
 # TODO: Move to a common util.
 def normalize_movie_name(inp):
     inp = inp.lower()
-    import re
     inp = re.sub(r'[\W_]+', ' ', inp)
     inp = re.sub(r' +', ' ', inp)
     return inp.strip()
