@@ -73,7 +73,7 @@ class MovieInfo(object):
         return 'n/a'
 
     def update_imdb(self, imdb_movie_set: ImdbMovieSet) -> MovieInfo:
-        self.imdb = imdb_movie_set.lookup_movie(self.name)
+        self.imdb = imdb_movie_set.lookup_movie(self.name, self.release_yr)
         for imdb_movie_info in self.imdb:
             self.languages.update(imdb_movie_info.languages)
             self.regions.update(imdb_movie_info.regions)

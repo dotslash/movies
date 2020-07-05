@@ -104,9 +104,16 @@ class ImdbMovieInfo(object):
             if type(may_be_set) != set:
                 return set(may_be_set)
 
+        def tryint(inp, default):
+            try:
+                return int(inp)
+            except Exception:
+                return default
+
         self.languages = _to_set(self.languages)
         self.regions = _to_set(self.regions)
         self.titles = _to_set(self.titles)
+        self.year = tryint(self.year, -1)
         return self
 
     def _get_title_from_imdb_dot_com(self) -> typing.Dict[str, typing.Set[str]]:
@@ -161,9 +168,14 @@ class ImdbMovieSet:
             for title in movie.titles:
                 self.name_to_id[normalize_movie_name(title)].add(imdb_id)
 
-    def lookup_movie(self, name) -> typing.List[ImdbMovieInfo]:
+    def lookup_movie(self, name: str, release_yr: int) -> typing.List[ImdbMovieInfo]:
         name = normalize_movie_name(name)
-        return [self.id_to_movie[imdb_id] for imdb_id in self.name_to_id.get(name, [])]
+        ret = []
+        for imdb_id in self.name_to_id.get(name, []):
+            movie = self.id_to_movie[imdb_id]
+            if release_yr == -1 or movie.year == release_yr:
+                ret.append(movie)
+        return ret
 
     @staticmethod
     def _get_imdb_titles() -> typing.Dict[str, ImdbMovieInfo]:
@@ -209,8 +221,7 @@ class ImdbMovieSet:
         if is_empty_collection(imdb_ids):
             return []
         imdb_ids = imdb_ids or self.id_to_movie.keys()
-        progress_bar = tqdm(total=len(imdb_ids))
-        # error_bar = tqdm(desc="Errors")
+        progress_bar = tqdm(desc="Enhanncing movieset", total=len(imdb_ids))
         ret = []
 
         pool_sem = threading.BoundedSemaphore(value=5)
@@ -249,7 +260,7 @@ class ImdbMovieSet:
         total_count = 0
         imdb_ids = imdb_ids or self.id_to_movie.keys()
         log(f"Writing ImdbMovieSet to {MOVIES_DB}. num movies: {len(imdb_ids)}")
-        status = tqdm(total=len(imdb_ids))
+        status = tqdm(desc="Writing ImdbMovieSet", total=len(imdb_ids))
         for imdb_id in imdb_ids:
             movie = self.id_to_movie[imdb_id]
             queries = ImdbSqliteHelper.insert_movie_queries(movie)
@@ -284,7 +295,7 @@ def fetch_movies_from_name(names: typing.List[str]) -> typing.Dict[str, ImdbMovi
     c = conn.cursor()
     ret = {}
     norm_names = {normalize_movie_name(name) for name in names}
-    status = tqdm(total=len(norm_names))
+    status = tqdm(desc="Fetching from movie names", total=len(norm_names))
     for name in norm_names:
         c.execute(ImdbSqliteHelper.MOVIE_NAME_TO_MOVIES, (name,))
         for row in c.fetchall():
@@ -309,6 +320,8 @@ if __name__ == '__main__':
     parser.add_argument('--update', help='Reads IMDB csv files and updates sqlite', action='store_true')
     parser.add_argument('--lookup_id')
     parser.add_argument('--lookup_name')
+    parser.add_argument('--lookup_year', help="Returns movie released in this year. Relevant only for lookup_name",
+                        type=int, default=-1)
     args = parser.parse_args()
 
     IS_DUMMY = args.debug
@@ -322,8 +335,8 @@ if __name__ == '__main__':
         else:
             movie_set.write_to_sqlite()
     elif args.lookup_name:
-        movies = ImdbMovieSet(from_movie_names=[args.lookup_name])
-        print(json.dumps(list(attr.asdict(x) for x in movies.id_to_movie.values()), indent=2))
+        movies = ImdbMovieSet(from_movie_names=[args.lookup_name]).lookup_movie(args.lookup_name, args.lookup_year)
+        print(json.dumps(list(attr.asdict(m) for m in movies), indent=2))
     elif args.lookup_id:
         movie = fetch_movies_from_id(args.lookup_id)
         if not movie:
