@@ -361,8 +361,8 @@ def main():
     languages = set()
     if args.lang:
         languages = set(args.lang.split(','))
-    filtered_movies: typing.List[MovieInfo] = [m for m in movies if
-                                               m.matches(languages=languages, release_yr=args.year)]
+    filtered_movies: typing.List[MovieInfo] = [
+        m for m in movies if m.matches(languages=languages, release_yr=args.year)]
     filtered_movies.sort(key=lambda x: -int(x.release_yr))
     rows = [[m.name, m.release_yr,
              m.get_imdb_rating(),
@@ -370,10 +370,10 @@ def main():
              ','.join(set(l for l in m.languages if len(l) == 2))[:20],
              ','.join([x.imdb_id for x in m.imdb])[:50]]
             for m in filtered_movies]
-    SORTKEY_IND = 2  # year
+    SORTKEY_IND = 1  # year
     if args.sortby == 'rating':
-        SORTKEY_IND = 3  # rating
-    rows.sort(key=lambda x: -tryint(x[2], -1))
+        SORTKEY_IND = 2  # rating
+    rows.sort(key=lambda x: -tryint(x[SORTKEY_IND], -1))
     print(tabulate.tabulate(
         rows,
         headers=["name", "year", "imdb_rating", "lang", "lang_alt", "imdb"]))

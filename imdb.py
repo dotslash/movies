@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import json
+import pprint
 import re
 import sqlite3
 import sys
@@ -18,8 +20,7 @@ from tqdm import tqdm
 IMDB_BASICS_TSV = Path.expanduser(Path('~/data/imdb/title.basics.tsv'))
 IMDB_AKAS_TSV = Path.expanduser(Path('~/data/imdb/title.akas.tsv'))
 MOVIES_DB = Path.expanduser(Path('~/data/movies.db'))
-IS_DUMMY = len(sys.argv) > 1 and sys.argv[1] == "dummy"
-
+IS_DUMMY = False  # updated in __main__
 AKA_SRC = "https://datasets.imdbws.com/title.akas.tsv.gz"
 BASICS_SRC = "https://datasets.imdbws.com/title.basics.tsv.gz"
 
@@ -63,6 +64,10 @@ class ImdbSqliteHelper:
             from imdb_lookup 
             where lookup_key = ? 
                    and key_type = 'norm_title')"""
+    MOVIE_ID_TO_MOVIE = """
+        select data
+        from imdb
+        where imdb_id = ?"""
 
     @staticmethod
     def insert_movie_queries(movie: ImdbMovieInfo):
@@ -125,7 +130,7 @@ class ImdbMovieInfo(object):
 
         return ret
 
-    def enhance_data(self, error_func = None) -> ImdbMovieInfo:
+    def enhance_data(self, error_func=None) -> ImdbMovieInfo:
         if not self.imdb_id:  # There is no imdb id.
             return self
         if self.enhanced or self.enhancement_error:  # Already enhanced.
@@ -212,8 +217,8 @@ class ImdbMovieSet:
 
         def update_one_movie_and_update_progress(movie: ImdbMovieInfo):
             enhanced_before, enhancement_error_before = movie.enhanced, movie.enhancement_error
-            try: # attempt only if it's an error.
-                movie.enhance_data(error_func= lambda x: tqdm.write(x))
+            try:  # attempt only if it's an error.
+                movie.enhance_data(error_func=lambda x: tqdm.write(x))
             finally:
                 pool_sem.release()
             lock = threading.Lock()
@@ -264,6 +269,16 @@ class ImdbMovieSet:
         log(f"Wrote ImdbMovieSet to {MOVIES_DB}. num movies: {len(imdb_ids)}")
 
 
+def fetch_movies_from_id(imdb_id: str) -> typing.Optional[ImdbMovieInfo]:
+    conn = sqlite3.connect(str(MOVIES_DB))
+    c = conn.cursor()
+    c.execute(ImdbSqliteHelper.MOVIE_ID_TO_MOVIE, (imdb_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    return ImdbMovieInfo(**json.loads(row[0])).ensure_types()
+
+
 def fetch_movies_from_name(names: typing.List[str]) -> typing.Dict[str, ImdbMovieInfo]:
     conn = sqlite3.connect(str(MOVIES_DB))
     c = conn.cursor()
@@ -289,10 +304,32 @@ def normalize_movie_name(inp):
 
 
 if __name__ == '__main__':
-    movie_set = ImdbMovieSet()
-    log("Created ImdbMovieSet")
-    if IS_DUMMY:
-        enhanced = movie_set.enhance_movie_info(['tt0000009', 'tt0000675'])
-        movie_set.write_to_sqlite(['tt0000009', 'tt0000675'])
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--update', help='Reads IMDB csv files and updates sqlite', action='store_true')
+    parser.add_argument('--lookup_id')
+    parser.add_argument('--lookup_name')
+    args = parser.parse_args()
+
+    IS_DUMMY = args.debug
+
+    if args.update:
+        movie_set = ImdbMovieSet()
+        log("Created ImdbMovieSet")
+        if IS_DUMMY:
+            enhanced = movie_set.enhance_movie_info(['tt0000009', 'tt0000675'])
+            movie_set.write_to_sqlite(['tt0000009', 'tt0000675'])
+        else:
+            movie_set.write_to_sqlite()
+    elif args.lookup_name:
+        movies = ImdbMovieSet(from_movie_names=[args.lookup_name])
+        print(json.dumps(list(attr.asdict(x) for x in movies.id_to_movie.values()), indent=2))
+    elif args.lookup_id:
+        movie = fetch_movies_from_id(args.lookup_id)
+        if not movie:
+            print("Movie not found")
+        else:
+            print(json.dumps(attr.asdict(movie), indent=2))
     else:
-        movie_set.write_to_sqlite()
+        parser.print_help()
+        exit(-1)
