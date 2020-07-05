@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import typing
 
 import attr
 import requests
 import tabulate
 from bs4 import BeautifulSoup
+from pathlib import Path
+import tqdm
 
 from imdb import ImdbMovieSet, ImdbMovieInfo, normalize_movie_name
 
@@ -14,6 +17,7 @@ FIREFOX_USER_AGENT = \
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:72.0) Gecko/20100101 Firefox/72.0'
 AMAZON_PRIME = "amazon_prime"
 NETFLIX = "netflix"
+CACHE_DIR = Path('~/data/catalog_fetcher_cache').expanduser()
 
 
 def log(msg):
@@ -52,7 +56,7 @@ class MovieInfo(object):
 
     def get_netflix_url(self):
         for p in self.platforms:
-            if p.platform == NETFLIX:
+            if p.platform == NETFLIX and not p.value.startswith('slug'):
                 return f'https://www.netflix.com/title/{p.value}'
         for v in self.src_to_raw_entry.values():
             netflixid = v.get('netflixid')
@@ -63,6 +67,7 @@ class MovieInfo(object):
     def get_imdb_rating(self):
         for v in self.src_to_raw_entry.values():
             imdb_rating = v.get('imdb')
+            imdb_rating = imdb_rating or v.get('imdb_rating')
             if imdb_rating:
                 return imdb_rating
         return 'n/a'
@@ -246,6 +251,67 @@ def fetch_from_finder(provider, enhance):
     return [m.update_imdb(imdb_set) for m in ret]
 
 
+def get_reelgood_url(provider, start, count):
+    amazon_format = 'https://api.reelgood.com/v3.0/content/browse/source/amazon?availability=onSources&' + \
+                    'content_kind=movie&hide_seen=false&hide_tracked=false&hide_watchlisted=false&imdb_end=10&' + \
+                    'imdb_start=0&override_user_sources=true&overriding_free=false&overriding_sources=amazon_prime&' + \
+                    'region=us&rt_end=100&rt_start=0&{}&sort=0&sources=amazon_prime&{}&year_end=2020&year_start=1900'
+    netflix_format = 'https://api.reelgood.com/v3.0/content/browse/source/netflix?availability=onSources&' + \
+                     'content_kind=movie&hide_seen=false&hide_tracked=false&hide_watchlisted=false&imdb_end=10&' + \
+                     'imdb_start=0&override_user_sources=true&overriding_free=false&overriding_sources=netflix&' \
+                     'region=us&rt_end=100&rt_start=0&{}&sort=0&sources=netflix&{}&year_end=2020&year_start=1900'
+    url_formats = {AMAZON_PRIME: amazon_format, NETFLIX: netflix_format}
+    return url_formats[provider].format(f'skip={start}', f'take={count}')
+
+
+def populate_reelgood_cache(provider):
+    CACHE_DIR.mkdir(exist_ok=True)
+    done_file = Path(str(CACHE_DIR) + f'/reelgood_{provider}_done')
+    if done_file.exists():  # TODO: Recency
+        return
+    # Clear potentially corrupt reelgood files.
+    old_files = CACHE_DIR.glob(f'reelgood_{provider}*')
+    for of in old_files:
+        of.unlink()
+    # Fetch page by page.
+    PAGE_SIZE = 200
+    progress_bar = tqdm.tqdm(desc=f"reelgood for {provider}")
+    for page in range(1000):
+        url = get_reelgood_url(provider, PAGE_SIZE * page, PAGE_SIZE)
+        resp = requests.get(url)
+        of = Path(str(CACHE_DIR) + f'/reelgood_{provider}_from_{PAGE_SIZE * page}_sz_{PAGE_SIZE}.json')
+        of.write_text(json.dumps(resp.json()))
+        progress_bar.update(PAGE_SIZE)
+        if len(resp.json()['results']) == 0:
+            break
+    # Set the done file.
+    done_file.touch()
+
+
+def fetch_from_reelgood(provider, enhance):
+    print(f"Fetching {provider} from reelgood")
+    populate_reelgood_cache(provider)
+    files = CACHE_DIR.glob(f'reelgood_{provider}*.json')
+    ret: typing.List[MovieInfo] = []
+    for f in files:
+        movies = json.loads(f.read_text())['results']
+        for m in movies:
+            ret.append(MovieInfo(
+                name=m['title'],
+                src_to_raw_entry={f"reelgood:{provider}": m},
+                release_yr=tryint(m.get('released_on', '-1')[:4], -1),
+                platforms=[PlatformId(platform=provider, value=f'slug_{m["slug"]}')]
+            ))
+    imdb_set = ImdbMovieSet(from_movie_names=[m.name for m in ret])
+    if enhance:
+        log("IMDBMovie set created")
+        enhanced = imdb_set.enhance_movie_info()
+        log("Enhanced IMDBMovie set")
+        imdb_set.write_to_sqlite(enhanced)
+        log("Wrote Enhancements back to db")
+    return [m.update_imdb(imdb_set) for m in ret]
+
+
 def merge_netflix(movies1: typing.List[MovieInfo], movies2: typing.List[MovieInfo]):
     movies_by_id: typing.Dict[str, MovieInfo] = {m.get_netflix_url(): m for m in movies1 if
                                                  m.get_netflix_url()}
@@ -262,11 +328,13 @@ def merge_netflix(movies1: typing.List[MovieInfo], movies2: typing.List[MovieInf
     return list(movies_by_id.values())
 
 
-def get_netflix_all(enhance):
-    movies1: typing.List[MovieInfo] = fetch_from_whats_on_netflix(enhance)
-    movies2: typing.List[MovieInfo] = fetch_from_finder(NETFLIX, enhance)
-    movies = merge_netflix(movies1, movies2)
-    return movies
+def get_netflix_all(legacy, enhance):
+    if legacy:
+        movies1: typing.List[MovieInfo] = fetch_from_whats_on_netflix(enhance)
+        movies2: typing.List[MovieInfo] = fetch_from_finder(NETFLIX, enhance)
+        return merge_netflix(movies1, movies2)
+    else:
+        return fetch_from_reelgood(NETFLIX, enhance)
 
 
 def parse_args():
@@ -275,15 +343,20 @@ def parse_args():
     parser.add_argument('--lang', help='Comma separated language filter', default='')
     parser.add_argument('--year', help='Release year filter', type=int)
     parser.add_argument('--enhance', help='Enhance netflix movie information', type=bool, default=False)
+    parser.add_argument('--legacy', help='Use legacy fetcher', type=bool, default=False)
+    parser.add_argument('--sortby', choices=['year', 'rating'], default='year')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     if args.provider == 'netflix':
-        movies = get_netflix_all(args.enhance)
+        movies = get_netflix_all(args.legacy, args.enhance)
     elif args.provider == 'amazon':
-        movies =fetch_from_finder(AMAZON_PRIME, args.enhance)
+        if args.legacy:
+            movies = fetch_from_finder(AMAZON_PRIME, args.enhance)
+        else:
+            movies = fetch_from_reelgood(AMAZON_PRIME, args.enhance)
 
     languages = set()
     if args.lang:
@@ -292,15 +365,18 @@ def main():
                                                m.matches(languages=languages, release_yr=args.year)]
     filtered_movies.sort(key=lambda x: -int(x.release_yr))
     rows = [[m.name, m.release_yr,
-             m.get_netflix_url(),
              m.get_imdb_rating(),
-             # Skip lower case length 2 languages; This is unenhanced imdb info; mostly junk
-             ','.join(set(l for l in m.languages))[:50],
+             ','.join(set(l for l in m.languages if len(l) != 2))[:20],
+             ','.join(set(l for l in m.languages if len(l) == 2))[:20],
              ','.join([x.imdb_id for x in m.imdb])[:50]]
             for m in filtered_movies]
+    SORTKEY_IND = 2  # year
+    if args.sortby == 'rating':
+        SORTKEY_IND = 3  # rating
+    rows.sort(key=lambda x: -tryint(x[2], -1))
     print(tabulate.tabulate(
         rows,
-        headers=["name", "year", "watch_url", "imdb_rating", "lang", "imdb"]))
+        headers=["name", "year", "imdb_rating", "lang", "lang_alt", "imdb"]))
 
 
 if __name__ == '__main__':
